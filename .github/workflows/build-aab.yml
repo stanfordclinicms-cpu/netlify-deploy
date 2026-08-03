@@ -1,0 +1,67 @@
+name: Build Android App Bundle
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Expand uploaded zip if present
+        run: |
+          if [ -z "$(find . -maxdepth 4 -name gradlew -not -path '*/build/*')" ]; then
+            Z=$(find . -maxdepth 2 -iname "*.zip" | head -1)
+            if [ -n "$Z" ]; then echo "Expanding $Z"; unzip -q -o "$Z" -d .; fi
+          fi
+      - name: Locate project
+        id: proj
+        run: |
+          GW=$(find . -maxdepth 4 -name gradlew -not -path "*/build/*" | head -1)
+          if [ -z "$GW" ]; then
+            echo "::error::Could not find gradlew anywhere in this repo. Top-level contents:"; ls -la; exit 1
+          fi
+          echo "dir=$(dirname "$GW")" >> "$GITHUB_OUTPUT"
+          echo "Project found at: $(dirname "$GW")"
+      - name: Build unsigned bundle + APK
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon bundleRelease assembleRelease
+      - name: Check for signing secrets
+        id: haskey
+        run: echo "has=${{ secrets.UPLOAD_KEYSTORE_B64 != '' }}" >> "$GITHUB_OUTPUT"
+      - name: Sign (only if keystore secrets are configured)
+        if: steps.haskey.outputs.has == 'true'
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          echo "${{ secrets.UPLOAD_KEYSTORE_B64 }}" | base64 -d > upload.jks
+          AAB=app/build/outputs/bundle/release/app-release.aab
+          APK=app/build/outputs/apk/release/app-release-unsigned.apk
+          jarsigner -sigalg SHA256withRSA -digestalg SHA-256 \
+            -keystore upload.jks -storepass "${{ secrets.KEYSTORE_PASSWORD }}" \
+            "$AAB" "${{ secrets.KEY_ALIAS }}"
+          BT=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)
+          "$ANDROID_HOME/build-tools/$BT/zipalign" -f 4 "$APK" app-release-aligned.apk
+          "$ANDROID_HOME/build-tools/$BT/apksigner" sign \
+            --ks upload.jks --ks-pass "pass:${{ secrets.KEYSTORE_PASSWORD }}" \
+            --ks-key-alias "${{ secrets.KEY_ALIAS }}" \
+            --out app-release-signed.apk app-release-aligned.apk
+          echo "### assetlinks.json fingerprint (upload key)" >> "$GITHUB_STEP_SUMMARY"
+          keytool -list -v -keystore upload.jks -storepass "${{ secrets.KEYSTORE_PASSWORD }}" \
+            -alias "${{ secrets.KEY_ALIAS }}" | grep "SHA256:" >> "$GITHUB_STEP_SUMMARY"
+          rm -f upload.jks
+      - name: Collect outputs
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          mkdir -p out
+          cp app/build/outputs/bundle/release/app-release.aab out/
+          cp app/build/outputs/apk/release/app-release-unsigned.apk out/ 2>/dev/null || true
+          cp app-release-signed.apk out/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stanford-herb-shop-android
+          path: ${{ steps.proj.outputs.dir }}/out/*
+          retention-days: 30
